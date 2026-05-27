@@ -40,61 +40,90 @@ if not exist "%PDB%" (
     echo [ERROR] PDB not found: %PDB%
     exit /b 1
 )
-
 if not exist "%PS1%" (
     echo [ERROR] gen_srcsrv.ps1 not found: %PS1%
     exit /b 1
 )
-
 if not exist "%EXE%" (
-    echo [WARNING] EXE not found: %EXE%
+    echo [ERROR] EXE not found: %EXE%
+    echo [ERROR] EXE is required to extract GUID.
+    exit /b 1
 )
 
 REM =======================================================================
-REM 1. Copy Source and Required Files
+REM 0-1. Extract PDB GUID via PowerShell (cv info 방식)
 REM =======================================================================
 echo =========================================
-echo 1. Copy Source to Source Server
+echo 0-1. Extract PDB GUID
 echo =========================================
 
-REM ★ EXE/PDB 복사
-if exist "%EXE%" (
-    xcopy "%EXE%" "%SOURCE_SERVER%\%PROJECT%\Bin\" /Y
-)
-if exist "%PDB%" (
-    xcopy "%PDB%" "%SOURCE_SERVER%\%PROJECT%\Bin\" /Y
+REM PowerShell에서 PDB 바이너리를 직접 읽어 GUID 추출
+REM PDB7.0 포맷: offset 32부터 슈퍼블록, GUID는 고정 위치에 존재
+REM 실패 시 타임스탬프(wmic 없이 Get-Date) 사용
+for /f "usebackq delims=" %%G in (`powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "try {" ^
+    "  $b = [IO.File]::ReadAllBytes('%PDB%');" ^
+    "  $magic = [Text.Encoding]::ASCII.GetString($b[0..28]);" ^
+    "  if ($magic -notlike 'Microsoft C/C++*') { throw 'bad magic' }" ^
+    "  $pageSize  = [BitConverter]::ToInt32($b, 32);" ^
+    "  $rootPage  = [BitConverter]::ToInt32($b, 40);" ^
+    "  $rootOff   = $rootPage * $pageSize;" ^
+    "  $numStream = [BitConverter]::ToInt32($b, $rootOff);" ^
+    "  $pdbOff    = $rootOff + 4 + $numStream * 4 + 4;" ^
+    "  $guidBytes = $b[$pdbOff..($pdbOff+15)];" ^
+    "  $guid = [guid]$guidBytes;" ^
+    "  Write-Output $guid.ToString('N').ToUpper()" ^
+    "} catch {" ^
+    "  Write-Output (Get-Date -Format 'yyyyMMdd_HHmmss')" ^
+    "}"`) do set BUILD_GUID=%%G
+
+echo [INFO] Build GUID / Key: !BUILD_GUID!
+
+if "!BUILD_GUID!"=="" (
+    echo [ERROR] Failed to generate GUID key.
+    exit /b 1
 )
 
-REM 1) 프로젝트 루트의 파일들 (main.cpp 등)
-xcopy "%ROOT_PATH%\%PROJECT%\*.cpp" "%SOURCE_SERVER%\%PROJECT%\" /Y /D
-xcopy "%ROOT_PATH%\%PROJECT%\*.h" "%SOURCE_SERVER%\%PROJECT%\" /Y /D
+REM =======================================================================
+REM 1. Copy Source Files to Versioned Folder
+REM =======================================================================
+echo =========================================
+echo 1. Copy Source to Source Server [!BUILD_GUID!]
+echo =========================================
 
-REM 2) 주요 소스 폴더들
-xcopy "%ROOT_PATH%\%PROJECT%\Source\*" "%SOURCE_SERVER%\%PROJECT%\Source\" /E /I /Y /D
-xcopy "%ROOT_PATH%\%PROJECT%\Shaders\*" "%SOURCE_SERVER%\%PROJECT%\Shaders\" /E /I /Y /D
-xcopy "%ROOT_PATH%\%PROJECT%\ThirdParty\*" "%SOURCE_SERVER%\%PROJECT%\ThirdParty\" /E /I /Y /D
+set VERSIONED_SRC=%SOURCE_SERVER%\%PROJECT%\!BUILD_GUID!
+
+REM EXE/PDB 복사
+xcopy "%EXE%" "!VERSIONED_SRC!\Bin\" /Y /I
+xcopy "%PDB%" "!VERSIONED_SRC!\Bin\" /Y /I
+
+REM 소스 복사
+xcopy "%ROOT_PATH%\%PROJECT%\*.cpp"        "!VERSIONED_SRC!\"              /Y /D /I
+xcopy "%ROOT_PATH%\%PROJECT%\*.h"          "!VERSIONED_SRC!\"              /Y /D /I
+xcopy "%ROOT_PATH%\%PROJECT%\Source\*"     "!VERSIONED_SRC!\Source\"       /E /I /Y /D
+xcopy "%ROOT_PATH%\%PROJECT%\Shaders\*"    "!VERSIONED_SRC!\Shaders\"      /E /I /Y /D
+xcopy "%ROOT_PATH%\%PROJECT%\ThirdParty\*" "!VERSIONED_SRC!\ThirdParty\"   /E /I /Y /D
 
 if errorlevel 1 (echo [ERROR] xcopy failed & exit /b 1)
 
 REM =======================================================================
-REM 2. Create & Inject FULL SOURCE INDEX
+REM 2. Generate srcsrv.txt pointing to versioned folder
 REM =======================================================================
 echo =========================================
-echo 2. Generating Full Source Index Table
+echo 2. Generating Source Index (GUID: !BUILD_GUID!)
 echo =========================================
 
-REM PDB에 링크된 원본 소스 파일 목록 추출 (-r 옵션)
 "%SRCSRV_TOOLS%\srctool.exe" -r "%PDB%" > "%TEMP_RAW_LIST%"
 
 echo [DEBUG] raw_files.txt 앞 5줄:
 for /f "tokens=*" %%a in ('type "%TEMP_RAW_LIST%" ^| findstr /n "." ^| findstr /b "[1-5]:"') do echo %%a
 
-REM ps1 파일 실행
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" ^
-    -Project "%PROJECT%" ^
-    -SourceServer "%SOURCE_SERVER%" ^
-    -RawList "%TEMP_RAW_LIST%" ^
-    -SrcInfo "%SRCINFO%"
+    -Project      "%PROJECT%"         ^
+    -SourceServer "%SOURCE_SERVER%"   ^
+    -BuildGuid    "!BUILD_GUID!"      ^
+    -RawList      "%TEMP_RAW_LIST%"   ^
+    -SrcInfo      "%SRCINFO%"
 
 if errorlevel 1 (
     echo [ERROR] No source files indexed or PowerShell failed.
@@ -106,14 +135,13 @@ if exist "%TEMP_RAW_LIST%" del "%TEMP_RAW_LIST%"
 REM PDB에 소스 인덱스 주입
 echo [INFO] Running pdbstr...
 "%SRCSRV_TOOLS%\pdbstr.exe" -w -p:"%PDB%" -s:srcsrv -i:"%SRCINFO%"
-echo [INFO] pdbstr errorlevel: %errorlevel%
 if errorlevel 1 (echo [ERROR] pdbstr injection failed & exit /b 1)
 
 REM =======================================================================
 REM 3. Upload Indexed PDB and EXE to Symbol Server
 REM =======================================================================
 echo =========================================
-echo 3. Upload Indexed PDB and EXE to Symbol Server
+echo 3. Upload to Symbol Server
 echo =========================================
 
 set NEED_PDB_UPLOAD=1
@@ -123,13 +151,11 @@ if exist "%SYMBOL_SERVER%\000Admin\history.txt" (
 )
 
 if !NEED_PDB_UPLOAD! equ 0 (
-    echo [SKIP] PDB is already uploaded to Symbol Server.
+    echo [SKIP] PDB already in Symbol Server.
 ) else (
     echo [UPLOAD] Uploading Indexed PDB...
     "%SDK_TOOLS%\symstore.exe" add /f "%PDB%" /s "%SYMBOL_SERVER%" /t "%PROJECT%"
-    if !errorlevel! geq 1 (
-        echo [ERROR] symstore PDB failed & exit /b 1
-    )
+    if !errorlevel! geq 1 (echo [ERROR] symstore PDB failed & exit /b 1)
 )
 
 if exist "%EXE%" (
@@ -138,36 +164,27 @@ if exist "%EXE%" (
         findstr /I /C:"\"%PROJECT%.exe\"" "%SYMBOL_SERVER%\000Admin\history.txt" >nul 2>&1
         if !errorlevel! equ 0 (set NEED_EXE_UPLOAD=0)
     )
-
     if !NEED_EXE_UPLOAD! equ 0 (
-        echo [SKIP] EXE is already uploaded to Symbol Server.
+        echo [SKIP] EXE already in Symbol Server.
     ) else (
         echo [UPLOAD] Uploading EXE...
         "%SDK_TOOLS%\symstore.exe" add /f "%EXE%" /s "%SYMBOL_SERVER%" /t "%PROJECT%"
-        if !errorlevel! geq 1 (
-            echo [ERROR] symstore EXE failed & exit /b 1
-        )
+        if !errorlevel! geq 1 (echo [ERROR] symstore EXE failed & exit /b 1)
     )
-) else (
-    echo [WARNING] Skipping EXE upload because EXE not found.
 )
 
 REM =======================================================================
 REM 4. Verify
 REM =======================================================================
 echo =========================================
-echo 4. Verify PDB Indexing Status
+echo 4. Verify PDB Indexing
 echo =========================================
 
-echo [INFO] srctool verify:
 "%SRCSRV_TOOLS%\srctool.exe" "%PDB%"
-echo [INFO] srctool errorlevel: %errorlevel%
-
-echo [INFO] pdbstr readback:
 "%SRCSRV_TOOLS%\pdbstr.exe" -r -p:"%PDB%" -s:srcsrv
+
 echo =========================================
-echo DONE
+echo DONE  [GUID: !BUILD_GUID!]
 echo =========================================
 pause
-
 endlocal
