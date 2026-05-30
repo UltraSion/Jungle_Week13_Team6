@@ -16,14 +16,12 @@ float4 PS(PS_Input_UV input) : SV_Target
 {
     float2 uv = input.uv;
     float4 center = DOFColorCoCTex.SampleLevel(LinearClampSampler, uv, 0);
-    float signedCenterCoC = center.a;
-    float centerCoC = abs(signedCenterCoC);
+    float centerCoC = max(center.a, 0.0f);
 
     if (centerCoC < 0.01f)
-        return center;
-
-    float3 accumColor = center.rgb;
-    float totalWeight = 1.0f;
+    {
+        return float4(center.rgb, 0.0f);
+    }
 
     int targetRings = 1;
     if (centerCoC > 10.0f)
@@ -43,6 +41,9 @@ float4 PS(PS_Input_UV input) : SV_Target
     float sampleJitter = InterleavedGradientNoise(input.position.xy);
     float polygonStrength = smoothstep(2.0f, 8.0f, centerCoC);
 
+    float3 accumColor = center.rgb;
+    float totalWeight = 1.0f;
+
     [loop]
     for (int ring = 1; ring <= targetRings; ++ring)
     {
@@ -60,17 +61,16 @@ float4 PS(PS_Input_UV input) : SV_Target
 
             float2 sampleUV = uv + offset * polygonRadius * radiusFraction * centerCoC * DOFInvHalfResolution;
             float4 neighbor = DOFColorCoCTex.SampleLevel(LinearClampSampler, sampleUV, 0);
-            float neighborCoC = abs(neighbor.a);
+            float neighborCoC = max(neighbor.a, 0.0f);
 
             float cocWeight = saturate(neighborCoC / max(centerCoC, 0.001f));
-            float sideWeight = (signedCenterCoC * neighbor.a >= 0.0f) ? 1.0f : 0.15f;
             float ringWeight = lerp(1.0f, radiusFraction, 0.35f);
-            float weight = cocWeight * sideWeight * ringWeight;
+            float weight = cocWeight * ringWeight;
 
             accumColor += neighbor.rgb * weight;
             totalWeight += weight;
         }
     }
 
-    return float4(accumColor / max(totalWeight, 0.0001f), signedCenterCoC);
+    return float4(accumColor / max(totalWeight, 0.0001f), saturate(centerCoC / max(DOFMaxCoCRadius, 0.001f)));
 }
